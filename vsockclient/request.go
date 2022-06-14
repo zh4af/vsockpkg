@@ -17,35 +17,36 @@ var (
 	Default_Request_Timeout = time.Second * 30
 )
 
-var (
-	allRequest    = make(map[uint64]chan *msgbuf.MsgBody, 100) // each msg with msg_id has one chan to recieve MsgBody
-	allRequestMtx sync.RWMutex
-)
+type Requester struct {
+	requests map[uint64]chan *msgbuf.MsgBody
+	sync.RWMutex
+}
 
-func NewRequest(msgId uint64) (uint64, chan *msgbuf.MsgBody) {
+func (cli *VsockClient) NewRequest() (uint64, chan *msgbuf.MsgBody) {
 	var ch = make(chan *msgbuf.MsgBody)
-	allRequestMtx.Lock()
-	allRequest[msgId] = ch
-	allRequestMtx.Unlock()
+	var msgId = utils.GenerateRandomUint64()
+	cli.requester.Lock()
+	cli.requester.requests[msgId] = ch
+	cli.requester.Unlock()
 	return msgId, ch
 }
 
-func ClearRequest(msgId uint64) {
-	allRequestMtx.Lock()
-	if ch := allRequest[msgId]; ch != nil {
+func (cli *VsockClient) ClearRequest(msgId uint64) {
+	cli.requester.Lock()
+	if ch := cli.requester.requests[msgId]; ch != nil {
 		close(ch)
 	}
-	delete(allRequest, msgId)
-	allRequestMtx.Unlock()
+	delete(cli.requester.requests, msgId)
+	cli.requester.Unlock()
 }
 
-func CallbackRequest(msg *msgbuf.MsgBody) {
+func (cli *VsockClient) CallbackRequest(msg *msgbuf.MsgBody) {
 	if msg == nil {
 		return
 	}
-	allRequestMtx.RLock()
-	defer allRequestMtx.RUnlock()
-	ch := allRequest[msg.MsgId()]
+	cli.requester.RLock()
+	defer cli.requester.RUnlock()
+	ch := cli.requester.requests[msg.MsgId()]
 	if ch != nil {
 		select {
 		case _, ok := <-ch:
@@ -58,8 +59,8 @@ func CallbackRequest(msg *msgbuf.MsgBody) {
 	}
 }
 
-func WaitRequest(msg proto.Message, msgType uint16) (*msgbuf.MsgBody, error) {
-	if !DefaultVsockClient.ready {
+func (cli *VsockClient) Request(msg proto.Message, msgType uint16) (*msgbuf.MsgBody, error) {
+	if !cli.ready {
 		return nil, Err_Vsock_Client_Not_Ready
 	}
 	var body []byte
@@ -71,9 +72,9 @@ func WaitRequest(msg proto.Message, msgType uint16) (*msgbuf.MsgBody, error) {
 		}
 	}
 
-	msgId, ch := NewRequest(utils.GenerateRandomUint64())
-	defer ClearRequest(msgId)
-	err = DefaultVsockClient.sendPack(body, msgType, msgId)
+	msgId, ch := cli.NewRequest()
+	defer cli.ClearRequest(msgId)
+	err = cli.sendPack(body, msgType, msgId)
 	if err != nil {
 		return nil, err
 	}

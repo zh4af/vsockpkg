@@ -87,6 +87,9 @@ func (msg *MsgBody) MsgId() uint64 {
 }
 
 func (msg *MsgBody) Clear() {
+	if msg == nil {
+		return
+	}
 	if msg.buffer != nil {
 		BufPool.Put(msg.buffer)
 		msg.buffer = nil
@@ -98,7 +101,7 @@ func (msg *MsgBody) Clear() {
 }
 
 func (msg *MsgBody) Pack() {
-	if msg.buffer == nil {
+	if msg == nil || msg.buffer == nil {
 		return
 	}
 	bodyLen := 0

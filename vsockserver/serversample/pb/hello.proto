@@ -1,0 +1,18 @@
+syntax = "proto3";
+
+package pb;
+
+enum MessageType {
+    // 保留
+    MESSAGETYPE_NA = 0;
+    // KMS CREDENTIALS
+    MSG_HELLO = 1;
+}
+
+message HelloReq {
+    string hi = 1;
+}
+
+message HelloRsp {
+    string hello = 1;
+}

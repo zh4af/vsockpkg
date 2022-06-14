@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"sync"
 	"time"
 
 	"github.com/Sirupsen/logrus"
@@ -36,7 +37,12 @@ type VsockClient struct {
 
 	ready bool
 
-	onConnected func() error
+	onConnected   func() error
+	connectedDone chan struct{}
+
+	once *sync.Once
+
+	requester Requester
 }
 
 var DefaultVsockClient *VsockClient
@@ -48,39 +54,44 @@ var DefaultVsockClient *VsockClient
 */
 func NewVsockClient(enclave_cid, port uint32, onConnected func() error) *VsockClient {
 	client := &VsockClient{
-		enclave_cid: enclave_cid,
-		port:        port,
-		closed:      make(chan struct{}),
-		writeMsg:    make(chan *msgbuf.MsgBody, 100),
-		onConnected: onConnected,
+		enclave_cid:   enclave_cid,
+		port:          port,
+		closed:        make(chan struct{}),
+		writeMsg:      make(chan *msgbuf.MsgBody, 100000),
+		onConnected:   onConnected,
+		connectedDone: make(chan struct{}),
+		once:          &sync.Once{},
+		requester: Requester{
+			requests: make(map[uint64]chan *msgbuf.MsgBody, 100000),
+		},
 	}
 	client.log = logrus.WithFields(logrus.Fields{"port": port})
 
 	DefaultVsockClient = client
 	go client.Start()
+	DefaultVsockClient.WaitConnectedDone()
 	return client
 }
 
 func (cli *VsockClient) ReInit() {
 	cli.closed = make(chan struct{})
-	cli.writeMsg = make(chan *msgbuf.MsgBody, 100)
+	cli.writeMsg = make(chan *msgbuf.MsgBody, 100000)
+	cli.once = &sync.Once{}
 }
 
 func (cli *VsockClient) Start() {
-	go func() {
-		var err error
-		for {
-			err = cli.connectAndServe() // reconnect if failed
-			switch err {
-			case Err_Vsock_Client_Dial:
-				time.Sleep(time.Second * 5)
-			case Err_Vsock_Client_Exit:
-				time.Sleep(time.Second)
-			default:
-			}
-			cli.ReInit()
+	var err error
+	for {
+		err = cli.connectAndServe() // reconnect if failed
+		switch err {
+		case Err_Vsock_Client_Dial:
+			time.Sleep(time.Second * 5)
+		case Err_Vsock_Client_Exit:
+			time.Sleep(time.Second)
+		default:
 		}
-	}()
+		cli.ReInit()
+	}
 }
 
 func (cli *VsockClient) connectAndServe() error {
@@ -99,27 +110,33 @@ func (cli *VsockClient) connectAndServe() error {
 func (cli *VsockClient) Close() error {
 	var err error
 	cli.ready = false
-	err = cli.conn.Close()
 	select {
 	case _, ok := <-cli.closed:
 		if !ok { // chan closed
 			return nil
 		}
 	default:
-		close(cli.closed)
-		if len(cli.writeMsg) > 0 {
-			for v := range cli.writeMsg {
-				if v != nil {
-					v.Clear()
-				}
-				if len(cli.writeMsg) <= 0 {
-					break
+		cli.once.Do(func() {
+			close(cli.closed)
+			err = cli.conn.Close()
+			if len(cli.writeMsg) > 0 {
+				for v := range cli.writeMsg {
+					if v != nil {
+						v.Clear()
+					}
+					if len(cli.writeMsg) <= 0 {
+						break
+					}
 				}
 			}
-		}
-		close(cli.writeMsg)
+			close(cli.writeMsg)
+		})
 	}
 	return err
+}
+
+func (cli *VsockClient) WaitConnectedDone() {
+	<-cli.connectedDone
 }
 
 func (cli *VsockClient) serverLoop() {
@@ -130,11 +147,15 @@ func (cli *VsockClient) serverLoop() {
 
 	cli.ready = true
 
-	// set credentials when reconnect to vsock server
-	err = cli.onConnected()
-	if err != nil {
-		return
+	// onConnected when reconnect to vsock server
+	if cli.onConnected != nil {
+		err = cli.onConnected()
+		if err != nil {
+			cli.Close()
+			return
+		}
 	}
+	cli.connectedDone <- struct{}{}
 
 	pingTicker := time.NewTicker(5 * time.Second)
 	defer pingTicker.Stop()
@@ -266,7 +287,7 @@ func (cli *VsockClient) onMessage(msg *msgbuf.MsgBody) {
 	case MSG_TYPE_RESERVE_PONG:
 		cli.onPong(msg)
 	default:
-		CallbackRequest(msg) // the msg should Clear by request side after handle msg
+		cli.CallbackRequest(msg) // the msg should Clear by request side after handle msg
 	}
 }
 

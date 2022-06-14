@@ -20,6 +20,7 @@ type ConnHandler struct {
 
 	closed chan struct{}
 
+	readMsg  chan *msgbuf.MsgBody
 	writeMsg chan *msgbuf.MsgBody
 
 	log *logrus.Entry
@@ -31,7 +32,8 @@ func NewConnHandler(conn net.Conn) *ConnHandler {
 		conn:       conn,
 		remoteAddr: conn.RemoteAddr().String(),
 		closed:     make(chan struct{}),
-		writeMsg:   make(chan *msgbuf.MsgBody, 100),
+		readMsg:    make(chan *msgbuf.MsgBody, 100000),
+		writeMsg:   make(chan *msgbuf.MsgBody, 100000),
 	}
 	handler.log = logrus.WithFields(logrus.Fields{
 		"connId":     handler.connId,
@@ -60,6 +62,7 @@ func (handler *ConnHandler) Close() {
 				}
 			}
 		}
+		close(handler.readMsg)
 		close(handler.writeMsg)
 		logrus.WithFields(logrus.Fields{
 			"connId":     handler.connId,
@@ -71,6 +74,7 @@ func (handler *ConnHandler) Close() {
 func (handler *ConnHandler) ServerLoop() {
 	go handler.writeLoop()
 	go handler.readLoop()
+	go handler.onMessage()
 
 	var err error
 	pingTicker := time.NewTicker(5 * time.Second)
@@ -187,40 +191,37 @@ func (handler *ConnHandler) readLoop() {
 		}
 
 		msg.UnPack()
-		handler.onMessage(msg)
+		// handler.onMessage(msg)
+		select {
+		case _, ok := <-handler.closed:
+			if !ok {
+				return
+			}
+		case handler.readMsg <- msg:
+		}
 	}
 }
 
-func (handler *ConnHandler) onMessage(msg *msgbuf.MsgBody) {
-	defer func() {
-		utils.RecoverStack()
-		msg.Clear()
-	}()
-
-	switch msg.MsgType() {
-	case MSG_TYPE_RESERVE_PING:
-		handler.onPing(msg)
-	case MSG_TYPE_RESERVE_PONG:
-		handler.onPong(msg)
-	default:
-		var bodyRet []byte
-		f, err := GetServHandler(msg.MsgType())
-		if f == nil && err != nil {
-			bodyRet = []byte(err.Error())
-		}
-		retMsg, err := f(msg)
-		if err != nil {
-			handler.log.WithError(err).Error("handler err")
-			bodyRet = []byte(err.Error())
-		} else {
-			bodyRet, err = proto.Marshal(retMsg)
-			if err != nil {
-				handler.log.WithError(err).Error("marshal message err")
-				bodyRet = []byte(err.Error())
+func (handler *ConnHandler) onMessage() {
+	for {
+		select {
+		case _, ok := <-handler.closed:
+			if !ok {
+				return
+			}
+		case msg := <-handler.readMsg:
+			if msg != nil {
+				switch msg.MsgType() {
+				case MSG_TYPE_RESERVE_PING:
+					handler.onPing(msg)
+				case MSG_TYPE_RESERVE_PONG:
+					handler.onPong(msg)
+				default:
+					handler.onHandle(msg)
+				}
+				msg.Clear()
 			}
 		}
-
-		handler.sendPack(bodyRet, msg.MsgType(), msg.MsgId())
 	}
 }
 
@@ -232,4 +233,28 @@ func (handler *ConnHandler) onPing(msg *msgbuf.MsgBody) {
 func (handler *ConnHandler) onPong(msg *msgbuf.MsgBody) {
 	// handler.log.Debug("onPong")
 	return
+}
+
+func (handler *ConnHandler) onHandle(msg *msgbuf.MsgBody) {
+	var bodyRet []byte
+	f, err := GetServHandler(msg.MsgType())
+	if f == nil && err != nil {
+		logrus.WithFields(logrus.Fields{"err": err, "msgType": msg.MsgType()}).Error("onHandle err")
+		bodyRet = []byte(err.Error())
+		handler.sendPack(bodyRet, msg.MsgType(), msg.MsgId())
+		return
+	}
+	retMsg, err := f(msg)
+	if err != nil {
+		handler.log.WithError(err).Error("handler err")
+		bodyRet = []byte(err.Error())
+	} else {
+		bodyRet, err = proto.Marshal(retMsg)
+		if err != nil {
+			handler.log.WithError(err).Error("marshal message err")
+			bodyRet = []byte(err.Error())
+		}
+	}
+
+	handler.sendPack(bodyRet, msg.MsgType(), msg.MsgId())
 }
